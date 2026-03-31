@@ -12,9 +12,7 @@ use api::{
     ToolResultContentBlock,
 };
 
-use commands::{
-    handle_slash_command, render_slash_command_help, resume_supported_slash_commands, SlashCommand,
-};
+use commands::{render_slash_command_help, resume_supported_slash_commands, SlashCommand};
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
 use runtime::{
@@ -358,6 +356,24 @@ fn format_init_report(path: &Path, created: bool) -> String {
     }
 }
 
+fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
+    if skipped {
+        format!(
+            "Compact
+  Result           skipped
+  Reason           session below compaction threshold
+  Messages kept    {resulting_messages}"
+        )
+    } else {
+        format!(
+            "Compact
+  Result           compacted
+  Messages removed {removed}
+  Messages kept    {resulting_messages}"
+        )
+    }
+}
+
 fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     let Some(status) = status else {
         return (None, None);
@@ -402,23 +418,20 @@ fn run_resume_command(
             message: Some(render_repl_help()),
         }),
         SlashCommand::Compact => {
-            let Some(result) = handle_slash_command(
-                "/compact",
+            let result = runtime::compact_session(
                 session,
                 CompactionConfig {
                     max_estimated_tokens: 0,
                     ..CompactionConfig::default()
                 },
-            ) else {
-                return Ok(ResumeCommandOutcome {
-                    session: session.clone(),
-                    message: None,
-                });
-            };
-            result.session.save_to_path(session_path)?;
+            );
+            let removed = result.removed_message_count;
+            let kept = result.compacted_session.messages.len();
+            let skipped = removed == 0;
+            result.compacted_session.save_to_path(session_path)?;
             Ok(ResumeCommandOutcome {
-                session: result.session,
-                message: Some(result.message),
+                session: result.compacted_session,
+                message: Some(format_compact_report(removed, kept, skipped)),
             })
         }
         SlashCommand::Clear { confirm } => {
@@ -746,6 +759,8 @@ impl LiveCli {
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let result = self.runtime.compact(CompactionConfig::default());
         let removed = result.removed_message_count;
+        let kept = result.compacted_session.messages.len();
+        let skipped = removed == 0;
         self.runtime = build_runtime_with_permission_mode(
             result.compacted_session,
             self.model.clone(),
@@ -753,7 +768,7 @@ impl LiveCli {
             true,
             permission_mode_label(),
         )?;
-        println!("Compacted {removed} messages.");
+        println!("{}", format_compact_report(removed, kept, skipped));
         Ok(())
     }
 }
@@ -1384,12 +1399,12 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_cost_report, format_init_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_resume_report,
-        format_status_report, normalize_permission_mode, parse_args, parse_git_status_metadata,
-        render_config_report, render_init_claude_md, render_memory_report, render_repl_help,
-        resume_supported_slash_commands, status_context, CliAction, SlashCommand, StatusUsage,
-        DEFAULT_MODEL,
+        format_compact_report, format_cost_report, format_init_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_resume_report, format_status_report, normalize_permission_mode, parse_args,
+        parse_git_status_metadata, render_config_report, render_init_claude_md,
+        render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
+        CliAction, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
     use std::path::{Path, PathBuf};
@@ -1519,6 +1534,16 @@ mod tests {
         assert!(report.contains("Session file     session.json"));
         assert!(report.contains("Messages         14"));
         assert!(report.contains("Turns            6"));
+    }
+
+    #[test]
+    fn compact_report_uses_structured_output() {
+        let compacted = format_compact_report(8, 5, false);
+        assert!(compacted.contains("Compact"));
+        assert!(compacted.contains("Result           compacted"));
+        assert!(compacted.contains("Messages removed 8"));
+        let skipped = format_compact_report(0, 3, true);
+        assert!(skipped.contains("Result           skipped"));
     }
 
     #[test]
